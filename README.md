@@ -74,4 +74,11 @@ RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
 
 Callers pin `@v1`. The `v1` tag moves to the latest compatible change; breaking changes get `v2`.
 
+Keep `v1` a **lightweight** tag. When it pointed at an annotated tag, every caller of `go-ci.yaml@v1` failed at startup with "workflow file issue", while the same commit worked as `@main`. To move it:
+
+```
+gh api -X DELETE repos/brightsheets/reusable-workflows/git/refs/tags/v1
+gh api repos/brightsheets/reusable-workflows/git/refs -f ref=refs/tags/v1 -f sha=$(git rev-parse main)
+```
+
 This repo is private. It's shared with the other `brightsheets` repos through Settings → Actions → General → Access ("Accessible from repositories owned by the user").
