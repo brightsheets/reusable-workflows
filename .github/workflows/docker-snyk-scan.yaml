@@ -1,0 +1,214 @@
+name: Snyk Container Scan
+
+# Reusable Snyk Container scan of an image built earlier in the run (the `docker save` tar
+# artifact from docker-build.yaml), scanned through Snyk's `docker-archive:` prefix.
+# Report-only by default (SARIF + PR comment); set fail-on-issues for a quality gate.
+# monitor publishes the snapshot with `snyk container monitor`, grouped per branch.
+#
+# Caller job permissions: contents: read, actions: read, security-events: write,
+# pull-requests: write.
+
+on:
+  workflow_call:
+    inputs:
+      image-artifact:
+        type: string
+        required: true
+        description: Name of the artifact holding the image tar.
+      image-artifact-file:
+        type: string
+        description: Tar file name inside the artifact. Defaults to <image-artifact>.tar.
+      dockerfile:
+        type: string
+        description: Dockerfile the image was built from; adds base-image upgrade advice.
+      fail-on-issues:
+        type: boolean
+        default: false
+      severity-threshold:
+        type: string
+        default: high
+        description: low | medium | high | critical
+      monitor:
+        type: boolean
+        default: false
+      project-name:
+        type: string
+        description: Snyk project name. Defaults to owner/repo.
+      snyk-org:
+        type: string
+        default: brightsheets
+    secrets:
+      snyk-token:
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  snyk-container:
+    name: Snyk Container Scan
+    runs-on: ubuntu-24.04
+    env:
+      SNYK_ORG: ${{ inputs.snyk-org }}
+      SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
+      PROJECT_NAME: ${{ inputs.project-name || github.repository }}
+      TARGET_REFERENCE: ${{ github.head_ref || github.ref_name }}
+      DOCKERFILE: ${{ inputs.dockerfile }}
+      IMAGE_TAR: ${{ inputs.image-artifact-file || format('{0}.tar', inputs.image-artifact) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download image tar
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.image-artifact }}
+          path: ${{ runner.temp }}/image
+
+      - name: Install Snyk CLI
+        uses: jdx/mise-action@v5
+        with:
+          mise_toml: |
+            [tools]
+            snyk = "1.1308.4"
+
+      - name: Snyk Container test
+        id: snyk-container
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: |
+          args=("docker-archive:$RUNNER_TEMP/image/$IMAGE_TAR" "--project-name=$PROJECT_NAME")
+          [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
+          [[ -n "$DOCKERFILE" ]] && args+=("--file=$DOCKERFILE")
+          rc=0
+          snyk container test --sarif-file-output=snyk-container.sarif --severity-threshold="$SEVERITY_THRESHOLD" "${args[@]}" || rc=$?
+          echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
+          if [[ $rc -gt 1 ]]; then
+            echo "::error title=Snyk Container scan failed::snyk container test exited with $rc: a scan error, not a finding."
+          fi
+          exit $rc
+
+      - name: Publish container snapshot to Snyk
+        id: snyk-monitor
+        if: inputs.monitor
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: |
+          args=("docker-archive:$RUNNER_TEMP/image/$IMAGE_TAR" "--project-name=$PROJECT_NAME" "--target-reference=$TARGET_REFERENCE")
+          [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
+          [[ -n "$DOCKERFILE" ]] && args+=("--file=$DOCKERFILE")
+          snyk container monitor "${args[@]}"
+
+      - name: Upload Container SARIF
+        if: ${{ !cancelled() && hashFiles('snyk-container.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container
+
+      - name: Comment summary on PR
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v9
+        env:
+          MARKER: "<!-- snyk-container-scan-summary -->"
+          TITLE: Snyk container scan
+          THRESHOLD: ${{ inputs.severity-threshold }}
+          SCANS: >-
+            [{"label": "Container", "file": "snyk-container.sarif", "outcome": "${{ steps.snyk-container.outcome }}"}]
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            let pr = context.payload.pull_request?.number;
+            if (!pr) {
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: context.sha });
+              pr = data.find((p) => p.state === 'open')?.number;
+            }
+            if (!pr) { core.info('No open PR for this commit; skipping the comment.'); return; }
+
+            const RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+            const threshold = process.env.THRESHOLD.toLowerCase();
+            const floor = RANK[threshold] ?? 3;
+            const byScore = (s) => (s >= 9 ? 'critical' : s >= 7 ? 'high' : s >= 4 ? 'medium' : s > 0 ? 'low' : null);
+            const byLevel = { error: 'high', warning: 'medium', note: 'low', none: 'low' };
+
+            // [] = clean, null = the scan didn't complete.
+            const findings = (file, outcome) => {
+              if (outcome === 'success') return [];
+              if (!fs.existsSync(file)) return null;
+              try {
+                const out = [];
+                for (const run of JSON.parse(fs.readFileSync(file, 'utf8')).runs || []) {
+                  const rules = new Map((run.tool?.driver?.rules || []).map((r) => [r.id, r]));
+                  for (const r of run.results || []) {
+                    const rule = rules.get(r.ruleId);
+                    const scored = byScore(parseFloat(rule?.properties?.['security-severity']));
+                    if (scored && RANK[scored] < floor) continue;
+                    const loc = r.locations?.[0]?.physicalLocation;
+                    out.push({
+                      sev: scored ?? byLevel[r.level ?? rule?.defaultConfiguration?.level ?? 'warning'],
+                      rule: r.ruleId || '',
+                      file: loc?.artifactLocation?.uri || '',
+                      text: (r.message?.text || '').split('\n')[0],
+                    });
+                  }
+                }
+                return out.sort((a, b) => RANK[b.sev] - RANK[a.sev]);
+              } catch (e) {
+                core.warning(`Unreadable ${file}: ${e.message}`);
+                return null;
+              }
+            };
+
+            const scans = JSON.parse(process.env.SCANS).map((s) => ({ ...s, found: findings(s.file, s.outcome) }));
+            const query = encodeURIComponent(context.payload.pull_request
+              ? `is:open pr:${pr}` : `is:open branch:${context.ref.replace('refs/heads/', '')}`);
+            const securityTab = `${context.serverUrl}/${owner}/${repo}/security/code-scanning?query=${query}`;
+            const lines = [
+              process.env.MARKER, `## ${process.env.TITLE}`, '',
+              `Showing \`${threshold}\` and above. All findings are in the [Security tab](${securityTab}).`, '',
+              '| Scan | Findings |', '| --- | ---: |',
+              ...scans.map((s) => `| ${s.label} | ${s.found === null ? ':warning: did not complete' : s.found.length} |`),
+            ];
+            for (const s of scans) {
+              if (!s.found?.length) continue;
+              lines.push('', `<details><summary><b>${s.label}</b> (${s.found.length})</summary>`, '');
+              for (const f of s.found.slice(0, 20)) {
+                lines.push(`- \`${f.sev}\` ${f.rule}${f.file ? ` (\`${f.file}\`)` : ''}${f.text ? `: ${f.text}` : ''}`);
+              }
+              if (s.found.length > 20) lines.push(`- ...and ${s.found.length - 20} more`);
+              lines.push('', '</details>');
+            }
+            const body = lines.join('\n');
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr, per_page: 100 });
+              const mine = comments.find((c) => c.body?.includes(process.env.MARKER));
+              if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              else await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });
+            } catch (e) {
+              core.warning(`Could not post the Snyk comment (fork or Dependabot PR?): ${e.message}`);
+            }
+
+      - name: Quality gate
+        if: inputs.fail-on-issues && steps.snyk-container.outcome == 'failure'
+        env:
+          RC: ${{ steps.snyk-container.outputs.exit-code }}
+        run: |
+          if [[ "$RC" == "1" ]]; then
+            echo "::error title=Snyk quality gate::Snyk Container found issues at or above '$SEVERITY_THRESHOLD'."
+          else
+            echo "::error title=Snyk quality gate::Snyk Container didn't complete (exit ${RC:-unknown}), so the gate can't pass."
+          fi
+          exit 1
+
+      - name: Fail if publishing to Snyk failed
+        if: ${{ !cancelled() && steps.snyk-monitor.outcome == 'failure' }}
+        run: |
+          echo "::error title=Snyk publish::snyk container monitor couldn't publish the image snapshot."
+          exit 1

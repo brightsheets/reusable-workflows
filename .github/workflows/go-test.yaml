@@ -1,0 +1,121 @@
+name: Go Test
+
+# Reusable `go test` run for one configuration. go-ci.yaml calls it once per matrix entry.
+# With test-coverage, the coverage profile is uploaded as artifact go-test-coverage-<matrix-id>.
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        description: Go version. Empty reads it from go.mod.
+      matrix-id:
+        type: string
+        default: standard
+        description: Name of this configuration (letters, digits, '-', '_').
+      test-additional-flags:
+        type: string
+        description: Extra flags for `go test` (e.g. "-race -tags=integration").
+      test-coverage:
+        type: boolean
+        default: false
+      vendor:
+        type: boolean
+        default: false
+        description: Run `go mod vendor` and test with -mod=vendor.
+      generate:
+        type: boolean
+        default: false
+      additional-tools:
+        type: string
+        description: Newline-separated `go install` targets.
+      go-private-owners:
+        type: string
+      gh-app-id:
+        type: string
+    secrets:
+      go-modules-token:
+        required: false
+      gh-app-private-key:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ inputs.matrix-id }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: GitHub App token for private modules
+        id: app-token
+        if: inputs.go-private-owners != '' && inputs.gh-app-id != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ inputs.gh-app-id }}
+          private-key: ${{ secrets.gh-app-private-key }}
+          owner: ${{ inputs.go-private-owners }}
+
+      - name: Configure private Go modules
+        if: inputs.go-private-owners != ''
+        env:
+          OWNERS: ${{ inputs.go-private-owners }}
+          TOKEN: ${{ secrets.go-modules-token || steps.app-token.outputs.token }}
+        run: |
+          goprivate=$(tr ', ' '\n\n' <<<"$OWNERS" | sed '/^$/d; s#^#github.com/#; s#$#/*#' | paste -sd, -)
+          echo "GOPRIVATE=$goprivate" >> "$GITHUB_ENV"
+          if [[ -z "$TOKEN" ]]; then
+            echo "::warning title=No token for private modules::Set go-modules-token (or a GitHub App). Only public modules will resolve."
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && 'go.mod' || '' }}
+
+      - name: Install additional tools
+        if: inputs.additional-tools != ''
+        env:
+          TOOLS: ${{ inputs.additional-tools }}
+        run: |
+          while read -r tool; do
+            [[ -n "$tool" ]] && go install "$tool"
+          done <<<"$TOOLS"
+
+      - name: go generate
+        if: inputs.generate
+        run: go generate ./...
+
+      - name: go mod vendor
+        if: inputs.vendor
+        run: go mod vendor
+
+      - name: go test
+        env:
+          FLAGS: ${{ inputs.test-additional-flags }}
+          COVERAGE: ${{ inputs.test-coverage }}
+          VENDOR: ${{ inputs.vendor }}
+          MATRIX_ID: ${{ inputs.matrix-id }}
+        run: |
+          args=()
+          read -r -a extra <<<"$FLAGS"
+          [[ "$VENDOR" == "true" ]] && args+=(-mod=vendor)
+          [[ "$COVERAGE" == "true" ]] && args+=(-coverprofile=coverage.out -covermode=atomic)
+          go test "${args[@]}" "${extra[@]}" ./...
+          if [[ "$COVERAGE" == "true" && -f coverage.out ]]; then
+            echo "### Coverage ($MATRIX_ID):$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage
+        if: inputs.test-coverage && hashFiles('coverage.out') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-test-coverage-${{ inputs.matrix-id }}
+          path: coverage.out
+          retention-days: 7

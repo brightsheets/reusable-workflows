@@ -1,0 +1,240 @@
+name: Go CI
+
+# Reusable CI pipeline for Go services:
+#   lint (golangci-lint) + tests (matrix) -> Snyk Open Source + Code -> Docker build -> Snyk Container
+#
+# - Snyk is report-only unless snyk-fail-on-issues is true. Results are published to Snyk
+#   (monitor) only on the default branch and hotfix/* branches, or always with snyk-force-monitor.
+# - The Docker steps run when docker-build is true. The image is pushed (GHCR by default) only on
+#   the default branch and hotfix/*, or with docker-force-push; dry-run never pushes.
+# - Private Go modules: go-private-owners + go-modules-token (or gh-app-id + gh-app-private-key).
+#
+# Caller job permissions: contents: read, actions: read, security-events: write,
+# pull-requests: write, and packages: write when pushing to GHCR.
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        description: Go version. Empty reads it from go.mod.
+      go-private-owners:
+        type: string
+        description: Comma-separated GitHub owners whose private Go modules are needed (e.g. "brightsheets").
+      gh-app-id:
+        type: string
+        description: GitHub App for private modules, when go-modules-token isn't passed (one owner only).
+      go-test-additional-test-matrix-json:
+        type: string
+        default: "[]"
+        description: >-
+          Extra test configurations, run after the default "standard" one (coverage on). Each entry:
+          {"identifier": "race", "additional-flags": "-race", "coverage": false}.
+      go-vendor:
+        type: boolean
+        default: false
+      go-generate:
+        type: boolean
+        default: false
+      go-additional-tools:
+        type: string
+        description: Newline-separated `go install` targets.
+      golangci-lint-version:
+        type: string
+        default: latest
+      docker-build:
+        type: boolean
+        default: false
+        description: Build the Docker image and scan it with Snyk Container.
+      docker-image-name:
+        type: string
+        description: Image name. Defaults to the repo name.
+      docker-context:
+        type: string
+        default: .
+      docker-file:
+        type: string
+      docker-build-args:
+        type: string
+      docker-registry:
+        type: string
+        default: ghcr.io
+      docker-force-push:
+        type: boolean
+        default: false
+      default-branch:
+        type: string
+        description: Treat this branch as the default branch (push + monitor). Empty = the repo's default.
+      dry-run:
+        type: boolean
+        default: false
+        description: Never push the image.
+      snyk-fail-on-issues:
+        type: boolean
+        default: false
+      snyk-severity-threshold:
+        type: string
+        default: high
+      snyk-project-name:
+        type: string
+      snyk-org:
+        type: string
+        default: brightsheets
+      snyk-force-monitor:
+        type: boolean
+        default: false
+    secrets:
+      snyk-token:
+        required: true
+      go-modules-token:
+        required: false
+      gh-app-private-key:
+        required: false
+      registry-username:
+        required: false
+      registry-password:
+        required: false
+    outputs:
+      image-ref:
+        value: ${{ jobs.docker-build.outputs.image-ref }}
+      image-tag:
+        value: ${{ jobs.docker-build.outputs.build-tag }}
+      image-digest:
+        value: ${{ jobs.docker-build.outputs.image-digest }}
+
+concurrency:
+  group: go-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-24.04
+    env:
+      EXTRA: ${{ inputs.go-test-additional-test-matrix-json }}
+      DEFAULT_BRANCH: ${{ inputs.default-branch || github.event.repository.default_branch }}
+      BRANCH: ${{ github.ref_name }}
+      REF: ${{ github.ref }}
+      EVENT: ${{ github.event_name }}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      release-branch: ${{ steps.branch.outputs.release }}
+    steps:
+      - name: Build test matrix
+        id: matrix
+        run: |
+          check() { jq -e "$1" <<<"$EXTRA" > /dev/null 2>&1 || { echo "::error title=Invalid go-test-additional-test-matrix-json::$2"; exit 1; }; }
+          check 'type == "array"' 'must be a JSON array'
+          check 'all(.[]; type == "object")' 'entries must be objects'
+          check 'all(.[]; (.identifier | type == "string") and (.identifier | test("^[A-Za-z0-9_-]+$")))' "each entry needs an 'identifier' of letters, digits, '-' or '_'"
+          check 'all(.[]; (has("additional-flags") | not) or (.["additional-flags"] | type == "string"))' "'additional-flags' must be a string"
+          check 'all(.[]; (has("coverage") | not) or (.coverage | type == "boolean"))' "'coverage' must be true or false"
+          echo "matrix=$(jq -c '[{"identifier": "standard", "coverage": true}] + .' <<<"$EXTRA")" >> "$GITHUB_OUTPUT"
+
+      - name: Is this the default or a hotfix branch?
+        id: branch
+        run: |
+          release=false
+          if [[ "$EVENT" != "pull_request" && ( "$BRANCH" == "$DEFAULT_BRANCH" || "$REF" == refs/heads/hotfix/* ) ]]; then
+            release=true
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: Lint
+    uses: ./.github/workflows/go-lint.yaml
+    with:
+      go-version: ${{ inputs.go-version }}
+      golangci-lint-version: ${{ inputs.golangci-lint-version }}
+      generate: ${{ inputs.go-generate }}
+      additional-tools: ${{ inputs.go-additional-tools }}
+      fail-on-issues: false
+      go-private-owners: ${{ inputs.go-private-owners }}
+      gh-app-id: ${{ inputs.gh-app-id }}
+    secrets:
+      go-modules-token: ${{ secrets.go-modules-token }}
+      gh-app-private-key: ${{ secrets.gh-app-private-key }}
+
+  test:
+    name: Test ${{ matrix.identifier }}
+    needs: [setup]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.setup.outputs.matrix) }}
+    uses: ./.github/workflows/go-test.yaml
+    with:
+      go-version: ${{ inputs.go-version }}
+      matrix-id: ${{ matrix.identifier }}
+      test-additional-flags: ${{ matrix.additional-flags }}
+      test-coverage: ${{ matrix.coverage || false }}
+      vendor: ${{ inputs.go-vendor }}
+      generate: ${{ inputs.go-generate }}
+      additional-tools: ${{ inputs.go-additional-tools }}
+      go-private-owners: ${{ inputs.go-private-owners }}
+      gh-app-id: ${{ inputs.gh-app-id }}
+    secrets:
+      go-modules-token: ${{ secrets.go-modules-token }}
+      gh-app-private-key: ${{ secrets.gh-app-private-key }}
+
+  snyk:
+    name: Snyk
+    needs: [setup]
+    uses: ./.github/workflows/go-snyk.yaml
+    with:
+      go-version: ${{ inputs.go-version }}
+      go-private-owners: ${{ inputs.go-private-owners }}
+      gh-app-id: ${{ inputs.gh-app-id }}
+      fail-on-issues: ${{ inputs.snyk-fail-on-issues }}
+      severity-threshold: ${{ inputs.snyk-severity-threshold }}
+      project-name: ${{ inputs.snyk-project-name }}
+      snyk-org: ${{ inputs.snyk-org }}
+      monitor: ${{ inputs.snyk-force-monitor || needs.setup.outputs.release-branch == 'true' }}
+    secrets:
+      snyk-token: ${{ secrets.snyk-token }}
+      go-modules-token: ${{ secrets.go-modules-token }}
+      gh-app-private-key: ${{ secrets.gh-app-private-key }}
+
+  docker-build:
+    name: Docker
+    needs: [setup, lint, test, snyk]
+    if: inputs.docker-build
+    uses: ./.github/workflows/docker-build.yaml
+    with:
+      image-name: ${{ inputs.docker-image-name }}
+      context: ${{ inputs.docker-context }}
+      dockerfile: ${{ inputs.docker-file }}
+      build-args: ${{ inputs.docker-build-args }}
+      registry: ${{ inputs.docker-registry }}
+      push: ${{ !inputs.dry-run && (inputs.docker-force-push || needs.setup.outputs.release-branch == 'true') }}
+      export-image: true
+      go-private-owners: ${{ inputs.go-private-owners }}
+      gh-app-id: ${{ inputs.gh-app-id }}
+    secrets:
+      registry-username: ${{ secrets.registry-username }}
+      registry-password: ${{ secrets.registry-password }}
+      go-modules-token: ${{ secrets.go-modules-token }}
+      gh-app-private-key: ${{ secrets.gh-app-private-key }}
+
+  container-scan:
+    name: Snyk Container
+    needs: [setup, docker-build]
+    if: inputs.docker-build && needs.docker-build.outputs.image-artifact != ''
+    uses: ./.github/workflows/docker-snyk-scan.yaml
+    with:
+      image-artifact: ${{ needs.docker-build.outputs.image-artifact }}
+      dockerfile: ${{ inputs.docker-file || format('{0}/Dockerfile', inputs.docker-context) }}
+      fail-on-issues: ${{ inputs.snyk-fail-on-issues }}
+      severity-threshold: ${{ inputs.snyk-severity-threshold }}
+      project-name: ${{ inputs.snyk-project-name && format('{0}-container', inputs.snyk-project-name) || format('{0}-container', github.repository) }}
+      snyk-org: ${{ inputs.snyk-org }}
+      monitor: ${{ inputs.snyk-force-monitor || needs.setup.outputs.release-branch == 'true' }}
+    secrets:
+      snyk-token: ${{ secrets.snyk-token }}

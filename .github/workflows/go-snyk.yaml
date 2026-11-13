@@ -1,0 +1,288 @@
+name: Go Snyk Scan
+
+# Reusable Snyk scan for Go: Open Source (dependencies) and Code (SAST).
+# - Report-only by default: findings go to GitHub Code Scanning (SARIF) and a PR comment.
+#   Set fail-on-issues to turn it into a quality gate.
+# - monitor: also publishes results to Snyk (`snyk monitor`, `snyk code test --report`),
+#   attributed to this repo and branch. Meant for the default branch and hotfix/* only.
+# - Private Go modules: set go-private-owners and pass go-modules-token (a PAT that can read
+#   those repos) or gh-app-id + gh-app-private-key (a GitHub App installed on one owner).
+#
+# Caller job permissions: contents: read, actions: read, security-events: write,
+# pull-requests: write. The Snyk token's role must be able to test and monitor projects; with
+# monitor it also needs "View Project Ignores", or `snyk code test --report` fails with 403.
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        description: Go version (e.g. "1.23", "stable"). Empty reads it from go.mod.
+      go-private-owners:
+        type: string
+        description: >-
+          Comma-separated GitHub owners whose private Go modules this repo needs
+          (e.g. "brightsheets"). Sets GOPRIVATE and git auth for github.com/<owner>/*.
+      gh-app-id:
+        type: string
+        description: GitHub App ID used for private modules when go-modules-token isn't set (one owner only).
+      fail-on-issues:
+        type: boolean
+        default: false
+        description: Fail the job on findings at or above severity-threshold.
+      severity-threshold:
+        type: string
+        default: high
+        description: low | medium | high | critical
+      monitor:
+        type: boolean
+        default: false
+        description: Publish results to the Snyk platform.
+      project-name:
+        type: string
+        description: Snyk Code project name when monitor is true. Defaults to owner/repo.
+      snyk-org:
+        type: string
+        default: brightsheets
+        description: Snyk org ID or slug (--org).
+    secrets:
+      snyk-token:
+        required: true
+      go-modules-token:
+        required: false
+        description: Token that can read the private module repos.
+      gh-app-private-key:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  snyk:
+    name: Snyk Scan
+    runs-on: ubuntu-24.04
+    env:
+      SNYK_ORG: ${{ inputs.snyk-org }}
+      SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
+      PROJECT_NAME: ${{ inputs.project-name || github.repository }}
+      REMOTE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+      TARGET_REFERENCE: ${{ github.head_ref || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: GitHub App token for private modules
+        id: app-token
+        if: inputs.go-private-owners != '' && inputs.gh-app-id != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ inputs.gh-app-id }}
+          private-key: ${{ secrets.gh-app-private-key }}
+          owner: ${{ inputs.go-private-owners }}
+
+      - name: Configure private Go modules
+        if: inputs.go-private-owners != ''
+        env:
+          OWNERS: ${{ inputs.go-private-owners }}
+          TOKEN: ${{ secrets.go-modules-token || steps.app-token.outputs.token }}
+        run: |
+          goprivate=$(tr ', ' '\n\n' <<<"$OWNERS" | sed '/^$/d; s#^#github.com/#; s#$#/*#' | paste -sd, -)
+          echo "GOPRIVATE=$goprivate" >> "$GITHUB_ENV"
+          if [[ -z "$TOKEN" ]]; then
+            echo "::warning title=No token for private modules::Set the go-modules-token secret (or gh-app-id + gh-app-private-key). Only public modules will resolve."
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && 'go.mod' || '' }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      # Pinned; Dependabot only tracks `uses:` lines, so bump this by hand.
+      - name: Install Snyk CLI
+        uses: jdx/mise-action@v5
+        with:
+          mise_toml: |
+            [tools]
+            snyk = "1.1308.4"
+
+      # Snyk exit codes: 0 clean, 1 issues found, anything else = the scan didn't complete.
+      - name: Snyk Open Source test
+        id: snyk-oss
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: |
+          args=()
+          [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
+          rc=0
+          snyk test --sarif-file-output=snyk-oss.sarif --severity-threshold="$SEVERITY_THRESHOLD" "${args[@]}" || rc=$?
+          echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
+          if [[ $rc -gt 1 ]]; then
+            echo "::error title=Snyk Open Source scan failed::snyk test exited with $rc: a scan error, not a finding."
+          fi
+          exit $rc
+
+      - name: Publish dependency snapshot to Snyk
+        id: snyk-monitor
+        if: inputs.monitor
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: |
+          args=("--remote-repo-url=$REMOTE_REPO_URL" "--target-reference=$TARGET_REFERENCE")
+          [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
+          snyk monitor "${args[@]}"
+
+      # Snyk Code has no "critical" level, and needs --project-name with --report.
+      - name: Snyk Code test
+        id: snyk-code
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+          MONITOR: ${{ inputs.monitor }}
+        run: |
+          args=()
+          [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
+          if [[ "$MONITOR" == "true" ]]; then
+            args+=(--report "--remote-repo-url=$REMOTE_REPO_URL" "--target-reference=$TARGET_REFERENCE" "--project-name=$PROJECT_NAME")
+          fi
+          threshold="$SEVERITY_THRESHOLD"
+          [[ "$threshold" == "critical" ]] && threshold=high
+          rc=0
+          snyk code test --sarif-file-output=snyk-code.sarif --severity-threshold="$threshold" "${args[@]}" || rc=$?
+          echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
+          if [[ $rc -gt 1 ]]; then
+            echo "::error title=Snyk Code scan failed::snyk code test exited with $rc: a scan error, not a finding (is Snyk Code enabled in the org? does the token's role have View Project Ignores?)."
+          fi
+          exit $rc
+
+      - name: Upload Open Source SARIF
+        if: ${{ !cancelled() && hashFiles('snyk-oss.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-oss.sarif
+          category: snyk-oss
+
+      - name: Upload Code SARIF
+        if: ${{ !cancelled() && hashFiles('snyk-code.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Comment summary on PR
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v9
+        env:
+          MARKER: "<!-- snyk-go-scan-summary -->"
+          TITLE: Snyk scan
+          THRESHOLD: ${{ inputs.severity-threshold }}
+          SCANS: >-
+            [{"label": "Open Source", "file": "snyk-oss.sarif", "outcome": "${{ steps.snyk-oss.outcome }}"},
+             {"label": "Code (SAST)", "file": "snyk-code.sarif", "outcome": "${{ steps.snyk-code.outcome }}"}]
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            let pr = context.payload.pull_request?.number;
+            if (!pr) {
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: context.sha });
+              pr = data.find((p) => p.state === 'open')?.number;
+            }
+            if (!pr) { core.info('No open PR for this commit; skipping the comment.'); return; }
+
+            const RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+            const threshold = process.env.THRESHOLD.toLowerCase();
+            const floor = RANK[threshold] ?? 3;
+            const byScore = (s) => (s >= 9 ? 'critical' : s >= 7 ? 'high' : s >= 4 ? 'medium' : s > 0 ? 'low' : null);
+            const byLevel = { error: 'high', warning: 'medium', note: 'low', none: 'low' };
+
+            // [] = clean, null = the scan didn't complete.
+            const findings = (file, outcome) => {
+              if (outcome === 'success') return [];
+              if (!fs.existsSync(file)) return null;
+              try {
+                const out = [];
+                for (const run of JSON.parse(fs.readFileSync(file, 'utf8')).runs || []) {
+                  const rules = new Map((run.tool?.driver?.rules || []).map((r) => [r.id, r]));
+                  for (const r of run.results || []) {
+                    const rule = rules.get(r.ruleId);
+                    const scored = byScore(parseFloat(rule?.properties?.['security-severity']));
+                    if (scored && RANK[scored] < floor) continue;
+                    const loc = r.locations?.[0]?.physicalLocation;
+                    out.push({
+                      sev: scored ?? byLevel[r.level ?? rule?.defaultConfiguration?.level ?? 'warning'],
+                      rule: r.ruleId || '',
+                      file: loc?.artifactLocation?.uri || '',
+                      text: (r.message?.text || '').split('\n')[0],
+                    });
+                  }
+                }
+                return out.sort((a, b) => RANK[b.sev] - RANK[a.sev]);
+              } catch (e) {
+                core.warning(`Unreadable ${file}: ${e.message}`);
+                return null;
+              }
+            };
+
+            const scans = JSON.parse(process.env.SCANS).map((s) => ({ ...s, found: findings(s.file, s.outcome) }));
+            const query = encodeURIComponent(context.payload.pull_request
+              ? `is:open pr:${pr}` : `is:open branch:${context.ref.replace('refs/heads/', '')}`);
+            const securityTab = `${context.serverUrl}/${owner}/${repo}/security/code-scanning?query=${query}`;
+            const lines = [
+              process.env.MARKER, `## ${process.env.TITLE}`, '',
+              `Showing \`${threshold}\` and above. All findings are in the [Security tab](${securityTab}).`, '',
+              '| Scan | Findings |', '| --- | ---: |',
+              ...scans.map((s) => `| ${s.label} | ${s.found === null ? ':warning: did not complete' : s.found.length} |`),
+            ];
+            for (const s of scans) {
+              if (!s.found?.length) continue;
+              lines.push('', `<details><summary><b>${s.label}</b> (${s.found.length})</summary>`, '');
+              for (const f of s.found.slice(0, 20)) {
+                lines.push(`- \`${f.sev}\` ${f.rule}${f.file ? ` (\`${f.file}\`)` : ''}${f.text ? `: ${f.text}` : ''}`);
+              }
+              if (s.found.length > 20) lines.push(`- ...and ${s.found.length - 20} more`);
+              lines.push('', '</details>');
+            }
+            const body = lines.join('\n');
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr, per_page: 100 });
+              const mine = comments.find((c) => c.body?.includes(process.env.MARKER));
+              if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              else await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });
+            } catch (e) {
+              core.warning(`Could not post the Snyk comment (fork or Dependabot PR?): ${e.message}`);
+            }
+
+      - name: Quality gate
+        if: inputs.fail-on-issues && (steps.snyk-oss.outcome == 'failure' || steps.snyk-code.outcome == 'failure')
+        env:
+          OSS: ${{ steps.snyk-oss.outputs.exit-code }}
+          CODE: ${{ steps.snyk-code.outputs.exit-code }}
+        run: |
+          for pair in "Open Source:$OSS" "Code:$CODE"; do
+            scan=${pair%%:*} rc=${pair#*:}
+            case "$rc" in
+              0) ;;
+              1) echo "::error title=Snyk quality gate::Snyk $scan found issues at or above '$SEVERITY_THRESHOLD'." ;;
+              *) echo "::error title=Snyk quality gate::Snyk $scan didn't complete (exit ${rc:-unknown}), so the gate can't pass." ;;
+            esac
+          done
+          exit 1
+
+      - name: Fail if publishing to Snyk failed
+        if: ${{ !cancelled() && steps.snyk-monitor.outcome == 'failure' }}
+        run: |
+          echo "::error title=Snyk publish::snyk monitor couldn't publish the dependency snapshot."
+          exit 1

@@ -1,0 +1,255 @@
+name: Docker Build
+
+# Reusable Docker build. Builds the image, optionally pushes it to a registry (GitHub Container
+# Registry by default: ghcr.io/<owner>/<image-name>), and by default uploads it as a
+# `docker save` tar artifact for docker-snyk-scan.yaml.
+#
+# Every image is tagged <sanitized-branch>-<sha7>. If that tag (or the extra `tag`) already
+# exists in the registry, the push is skipped so a rerun never overwrites a published image.
+#
+# Private Go modules: set go-private-owners and pass go-modules-token (or a GitHub App). The git
+# config with the token is handed to the build as the BuildKit secret `gitconfig`; use it with
+#   RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig go mod download
+#
+# Caller job permissions: contents: read, and packages: write to push to GHCR.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        description: Image name without registry. Defaults to the repo name.
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        description: Path to the Dockerfile. Defaults to <context>/Dockerfile.
+      build-args:
+        type: string
+        description: Multiline KEY=value build args.
+      tag:
+        type: string
+        description: Extra tag to apply besides <branch>-<sha7> (e.g. a version).
+      labels:
+        type: string
+        description: Extra multiline OCI labels.
+      push:
+        type: boolean
+        default: false
+      registry:
+        type: string
+        default: ghcr.io
+        description: Registry host. For GHCR the built-in GITHUB_TOKEN is used to log in.
+      registry-namespace:
+        type: string
+        description: Path under the registry. Defaults to the repo owner (lowercase).
+      export-image:
+        type: boolean
+        default: true
+        description: Upload the image as a `docker save` tar artifact (for the container scan).
+      cache:
+        type: boolean
+        default: true
+        description: Use the GitHub Actions build cache.
+      go-private-owners:
+        type: string
+        description: Comma-separated owners whose private Go modules the build needs.
+      gh-app-id:
+        type: string
+    secrets:
+      registry-username:
+        required: false
+        description: For registries other than GHCR.
+      registry-password:
+        required: false
+      go-modules-token:
+        required: false
+      gh-app-private-key:
+        required: false
+      build-args:
+        required: false
+        description: Secret multiline KEY=value build args.
+    outputs:
+      image-ref:
+        description: Full image reference with the build tag.
+        value: ${{ jobs.build.outputs.image-ref }}
+      image-digest:
+        description: Digest of the pushed image (empty when not pushed).
+        value: ${{ jobs.build.outputs.image-digest }}
+      build-tag:
+        description: The <branch>-<sha7> tag.
+        value: ${{ jobs.build.outputs.build-tag }}
+      image-artifact:
+        description: Name of the uploaded image tar artifact (empty when export-image is false).
+        value: ${{ jobs.build.outputs.image-artifact }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Docker Build
+    runs-on: ubuntu-24.04
+    outputs:
+      image-ref: ${{ steps.info.outputs.image-ref }}
+      image-digest: ${{ steps.push.outputs.digest }}
+      build-tag: ${{ steps.info.outputs.build-tag }}
+      image-artifact: ${{ steps.export.outputs.artifact }}
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v7
+
+      - name: GitHub App token for private modules
+        id: app-token
+        if: inputs.go-private-owners != '' && inputs.gh-app-id != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ inputs.gh-app-id }}
+          private-key: ${{ secrets.gh-app-private-key }}
+          owner: ${{ inputs.go-private-owners }}
+
+      - name: Stage git config for private modules
+        id: gitconfig
+        if: inputs.go-private-owners != ''
+        env:
+          TOKEN: ${{ secrets.go-modules-token || steps.app-token.outputs.token }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::warning title=No token for private modules::Set go-modules-token (or a GitHub App). The build gets no git credentials."
+            exit 0
+          fi
+          git config --file "$RUNNER_TEMP/gitconfig" url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "secret-file=gitconfig=$RUNNER_TEMP/gitconfig" >> "$GITHUB_OUTPUT"
+
+      - name: Compute image name and tags
+        id: info
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.registry-namespace || github.repository_owner }}
+          IMAGE_NAME: ${{ inputs.image-name || github.event.repository.name }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          SHA: ${{ steps.checkout.outputs.commit || github.sha }}
+          EXTRA_TAG: ${{ inputs.tag }}
+        run: |
+          # <branch>-<sha7>: lowercase, characters outside [a-z0-9._-] become '-', at most 120 chars.
+          branch=$(tr '[:upper:]' '[:lower:]' <<<"$BRANCH" | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/-+$//' | cut -c1-120)
+          build_tag="${branch:-detached}-${SHA:0:7}"
+          repo=$(tr '[:upper:]' '[:lower:]' <<<"$REGISTRY/$NAMESPACE/$IMAGE_NAME")
+          {
+            echo "build-tag=$build_tag"
+            echo "repository=$repo"
+            echo "image-ref=$repo:$build_tag"
+            echo "slug=${IMAGE_NAME//\//-}"
+            echo "tags<<EOF"
+            echo "$repo:$build_tag"
+            [[ -n "$EXTRA_TAG" ]] && echo "$repo:$EXTRA_TAG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to registry
+        if: inputs.push
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      - name: Check existing tags
+        id: exists
+        if: inputs.push
+        env:
+          TAGS: ${{ steps.info.outputs.tags }}
+        run: |
+          exist=false
+          while read -r ref; do
+            [[ -z "$ref" ]] && continue
+            if docker manifest inspect "$ref" > /dev/null 2>&1; then
+              exist=true
+              echo "::notice title=Tag already exists::$ref is already in the registry; the push will be skipped."
+            fi
+          done <<<"$TAGS"
+          echo "exist=$exist" >> "$GITHUB_OUTPUT"
+
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.info.outputs.repository }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.checkout.outputs.commit || github.sha }}
+            org.opencontainers.image.version=${{ inputs.tag || steps.info.outputs.build-tag }}
+            ${{ inputs.labels }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Built once and loaded into the local Docker daemon; the push and the tar export both use
+      # that image, so they are guaranteed to be the same bytes.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: ${{ steps.info.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: ${{ inputs.cache && 'type=gha' || '' }}
+          cache-to: ${{ inputs.cache && 'type=gha,mode=max' || '' }}
+          build-args: |
+            APP_VERSION=${{ inputs.tag || steps.info.outputs.build-tag }}
+            ${{ inputs.build-args }}
+            ${{ secrets.build-args }}
+          secret-files: ${{ steps.gitconfig.outputs.secret-file }}
+
+      - name: Push
+        id: push
+        if: inputs.push && steps.exists.outputs.exist != 'true'
+        env:
+          TAGS: ${{ steps.info.outputs.tags }}
+          IMAGE_REF: ${{ steps.info.outputs.image-ref }}
+        run: |
+          while read -r ref; do
+            [[ -n "$ref" ]] && docker push "$ref"
+          done <<<"$TAGS"
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE_REF" | head -1 | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Export image tar
+        id: export
+        if: inputs.export-image
+        env:
+          IMAGE_REF: ${{ steps.info.outputs.image-ref }}
+          SLUG: ${{ steps.info.outputs.slug }}
+        run: |
+          docker save "$IMAGE_REF" -o "$RUNNER_TEMP/$SLUG.tar"
+          echo "artifact=$SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload image tar
+        if: inputs.export-image
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.export.outputs.artifact }}
+          path: ${{ runner.temp }}/${{ steps.export.outputs.artifact }}.tar
+          retention-days: 1
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.info.outputs.tags }}
+          PUSH: ${{ inputs.push }}
+          SKIPPED: ${{ steps.exists.outputs.exist }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          if [[ "$PUSH" != "true" ]]; then status="Built (not pushed)"
+          elif [[ "$SKIPPED" == "true" ]]; then status="Built (push skipped: tag already exists)"
+          else status="Built and pushed"; fi
+          {
+            echo "## Docker build"
+            echo
+            echo "**$status**${DIGEST:+, digest \`$DIGEST\`}"
+            echo
+            while read -r ref; do [[ -n "$ref" ]] && echo "- \`$ref\`"; done <<<"$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
