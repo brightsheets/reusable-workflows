@@ -119,6 +119,16 @@ jobs:
           [[ -n "$DOCKERFILE" ]] && args+=("--file=$DOCKERFILE")
           snyk container monitor "${args[@]}"
 
+      # Snyk Container's SARIF can carry non-string fix text, which GitHub's validator rejects
+      # (".fixes[].artifactChanges[].replacements[].insertedContent.text is not of a type(s) string").
+      - name: Make the SARIF valid for GitHub
+        if: ${{ !cancelled() && hashFiles('snyk-container.sarif') != '' }}
+        run: |
+          jq '(.runs[]?.results[]?.fixes[]?.artifactChanges[]?.replacements[]?.insertedContent.text)
+                |= (if type == "string" then . elif . == null then "" else tostring end)' \
+            snyk-container.sarif > snyk-container.fixed.sarif
+          mv snyk-container.fixed.sarif snyk-container.sarif
+
       - name: Upload Container SARIF
         if: ${{ !cancelled() && hashFiles('snyk-container.sarif') != '' }}
         continue-on-error: true
