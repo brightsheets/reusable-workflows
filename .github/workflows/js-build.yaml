@@ -1,0 +1,133 @@
+name: JavaScript Build
+
+# Reusable build for JavaScript projects: sets up Node.js, restores the package manager cache,
+# installs dependencies with npm (default) or pnpm, and runs a package.json script.
+#
+# - strict-lockfile (default true) installs exactly from the lockfile (`npm ci` /
+#   `pnpm install --frozen-lockfile`); false allows the lockfile to change, for repos that
+#   don't keep it in sync.
+# - Set artifact-name and artifact-path to upload the build output for later jobs. The upload
+#   fails if the path matches no files, so a silently broken build can't pass as green.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        description: Git ref to check out. Defaults to the triggering ref.
+      runner-labels-json:
+        type: string
+        default: '["ubuntu-24.04"]'
+        description: JSON list of runner labels, used as-is for `runs-on`.
+      node-version:
+        type: string
+        default: lts/*
+        description: See https://github.com/actions/setup-node#supported-version-syntax
+      pnpm:
+        type: boolean
+        default: false
+        description: Use pnpm instead of npm.
+      pnpm-version:
+        type: string
+        default: "10"
+        description: pnpm version (a major resolves to its latest release). Only used with pnpm.
+      working-directory:
+        type: string
+        default: .
+        description: Directory with package.json. All commands run from here.
+      script-name:
+        type: string
+        default: build
+        description: package.json script to run.
+      strict-lockfile:
+        type: boolean
+        default: true
+      artifact-name:
+        type: string
+        description: Name of the build artifact to upload. Set together with artifact-path.
+      artifact-path:
+        type: string
+        description: Build output to upload, relative to working-directory.
+    outputs:
+      artifact-name:
+        value: ${{ jobs.build.outputs.artifact-name }}
+      artifact-id:
+        value: ${{ jobs.build.outputs.artifact-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.script-name }}
+    runs-on: ${{ fromJson(inputs.runner-labels-json) }}
+    env:
+      NPM: ${{ inputs.pnpm && 'pnpm' || 'npm' }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      artifact-name: ${{ steps.upload.outputs.artifact-id && inputs.artifact-name || '' }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        if: inputs.pnpm
+        uses: jdx/mise-action@v5
+        with:
+          working_directory: ${{ inputs.working-directory }}
+          cache: false
+          mise_toml: |
+            [tools]
+            pnpm = "${{ inputs.pnpm-version }}"
+
+      - name: Find the package cache directory
+        id: cache-dir
+        run: |
+          if [[ "$NPM" == "pnpm" ]]; then dir=$(pnpm store path); else dir=$(npm config get cache); fi
+          echo "path=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.cache-dir.outputs.path }}
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        env:
+          STRICT_LOCKFILE: ${{ inputs.strict-lockfile }}
+        run: |
+          case "$NPM:$STRICT_LOCKFILE" in
+            npm:true)   args=(ci) ;;
+            npm:false)  args=(install) ;;
+            pnpm:true)  args=(install --frozen-lockfile) ;;
+            pnpm:false) args=(install --no-frozen-lockfile) ;;
+          esac
+          "$NPM" "${args[@]}"
+
+      - name: Run ${{ inputs.script-name }}
+        env:
+          SCRIPT_NAME: ${{ inputs.script-name }}
+        run: |
+          "$NPM" run "$SCRIPT_NAME"
+
+      - name: Upload build output
+        id: upload
+        if: inputs.artifact-name != '' && inputs.artifact-path != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.artifact-path }}
+          if-no-files-found: error

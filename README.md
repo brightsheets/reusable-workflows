@@ -10,6 +10,9 @@ Reusable GitHub Actions workflows for `brightsheets` repos. Call them from a sho
 | [`docker-snyk-scan.yaml`](.github/workflows/docker-snyk-scan.yaml) | Snyk Container scan of that tar artifact, SARIF + PR comment, optional gate and monitor. |
 | [`go-lint.yaml`](.github/workflows/go-lint.yaml) | golangci-lint, report-only by default. |
 | [`go-test.yaml`](.github/workflows/go-test.yaml) | `go test` for one configuration, with optional coverage artifact. |
+| [`js-ci.yaml`](.github/workflows/js-ci.yaml) | JavaScript pipeline (npm or pnpm): build → Snyk Open Source + Code → Docker build → Snyk Container. |
+| [`js-build.yaml`](.github/workflows/js-build.yaml) | Installs dependencies and runs a package.json script (default `build`), with an optional build artifact. |
+| [`js-snyk.yaml`](.github/workflows/js-snyk.yaml) | Snyk Open Source and Code scans for a JavaScript project, SARIF + PR comment, optional gate and monitor. |
 
 Snyk scans are **report-only** by default: findings show in the Security tab and a PR comment, and the build passes. Set `snyk-fail-on-issues: true` to make them a gate. Results are published to Snyk (`snyk monitor`) only from the default branch and `hotfix/*`.
 
@@ -42,7 +45,20 @@ jobs:
       go-modules-token: ${{ secrets.GO_MODULES_TOKEN }}
 ```
 
-Just the Snyk scan:
+A JavaScript repo with a Dockerfile:
+
+```yaml
+jobs:
+  ci:
+    uses: brightsheets/reusable-workflows/.github/workflows/js-ci.yaml@v1
+    with:
+      node-version: "18"
+      docker-build: true
+    secrets:
+      snyk-token: ${{ secrets.SNYK_TOKEN }}
+```
+
+Just the Go Snyk scan:
 
 ```yaml
 jobs:

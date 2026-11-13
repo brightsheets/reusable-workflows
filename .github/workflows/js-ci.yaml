@@ -1,0 +1,204 @@
+name: JavaScript CI
+
+# Reusable CI pipeline for JavaScript projects (npm or pnpm):
+#   build (a package.json script) + Snyk Open Source + Code -> Docker build -> Snyk Container
+#
+# - build: false skips the build job (for apps with no build script).
+# - Snyk is report-only unless snyk-fail-on-issues is true, and is skipped with a warning when no
+#   snyk-token is passed. Results are published to Snyk (monitor) only on the default branch and
+#   hotfix/* branches, or always with snyk-force-monitor.
+# - The Docker steps run when docker-build is true. The image is pushed (GHCR by default) only on
+#   the default branch and hotfix/*, or with docker-force-push; dry-run never pushes.
+#
+# Caller job permissions: contents: read, actions: read, security-events: write,
+# pull-requests: write, packages: write.
+
+on:
+  workflow_call:
+    inputs:
+      runner-labels-json:
+        type: string
+        default: '["ubuntu-24.04"]'
+      node-version:
+        type: string
+        default: lts/*
+      pnpm:
+        type: boolean
+        default: false
+      pnpm-version:
+        type: string
+        default: "10"
+      working-directory:
+        type: string
+        default: .
+      strict-lockfile:
+        type: boolean
+        default: true
+      build:
+        type: boolean
+        default: true
+        description: Run the build job.
+      build-script:
+        type: string
+        default: build
+        description: package.json script the build job runs.
+      build-artifact-name:
+        type: string
+      build-artifact-path:
+        type: string
+      docker-build:
+        type: boolean
+        default: false
+        description: Build the Docker image and scan it with Snyk Container.
+      docker-image-name:
+        type: string
+      docker-context:
+        type: string
+        default: .
+      docker-file:
+        type: string
+      docker-build-args:
+        type: string
+      docker-registry:
+        type: string
+        default: ghcr.io
+      docker-force-push:
+        type: boolean
+        default: false
+      default-branch:
+        type: string
+        description: Treat this branch as the default branch (push + monitor). Empty = the repo's default.
+      dry-run:
+        type: boolean
+        default: false
+        description: Never push the image.
+      snyk-fail-on-issues:
+        type: boolean
+        default: false
+      snyk-severity-threshold:
+        type: string
+        default: high
+      snyk-project-name:
+        type: string
+      snyk-org:
+        type: string
+        default: brightsheets
+      snyk-force-monitor:
+        type: boolean
+        default: false
+    secrets:
+      snyk-token:
+        required: false
+        description: Snyk token. Without it the Snyk scans are skipped with a warning.
+      registry-username:
+        required: false
+      registry-password:
+        required: false
+    outputs:
+      build-artifact-name:
+        value: ${{ jobs.build.outputs.artifact-name }}
+      image-ref:
+        value: ${{ jobs.docker-build.outputs.image-ref }}
+      image-tag:
+        value: ${{ jobs.docker-build.outputs.build-tag }}
+      image-digest:
+        value: ${{ jobs.docker-build.outputs.image-digest }}
+
+concurrency:
+  group: js-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-24.04
+    env:
+      DEFAULT_BRANCH: ${{ inputs.default-branch || github.event.repository.default_branch }}
+      BRANCH: ${{ github.ref_name }}
+      REF: ${{ github.ref }}
+      EVENT: ${{ github.event_name }}
+    outputs:
+      release-branch: ${{ steps.branch.outputs.release }}
+    steps:
+      - name: Is this the default or a hotfix branch?
+        id: branch
+        run: |
+          release=false
+          if [[ "$EVENT" != "pull_request" && ( "$BRANCH" == "$DEFAULT_BRANCH" || "$REF" == refs/heads/hotfix/* ) ]]; then
+            release=true
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build
+    if: inputs.build
+    uses: ./.github/workflows/js-build.yaml
+    with:
+      runner-labels-json: ${{ inputs.runner-labels-json }}
+      node-version: ${{ inputs.node-version }}
+      pnpm: ${{ inputs.pnpm }}
+      pnpm-version: ${{ inputs.pnpm-version }}
+      working-directory: ${{ inputs.working-directory }}
+      script-name: ${{ inputs.build-script }}
+      strict-lockfile: ${{ inputs.strict-lockfile }}
+      artifact-name: ${{ inputs.build-artifact-name }}
+      artifact-path: ${{ inputs.build-artifact-path }}
+
+  snyk:
+    name: Snyk
+    needs: [setup]
+    uses: ./.github/workflows/js-snyk.yaml
+    with:
+      runner-labels-json: ${{ inputs.runner-labels-json }}
+      node-version: ${{ inputs.node-version }}
+      pnpm: ${{ inputs.pnpm }}
+      pnpm-version: ${{ inputs.pnpm-version }}
+      working-directory: ${{ inputs.working-directory }}
+      strict-lockfile: ${{ inputs.strict-lockfile }}
+      fail-on-issues: ${{ inputs.snyk-fail-on-issues }}
+      severity-threshold: ${{ inputs.snyk-severity-threshold }}
+      project-name: ${{ inputs.snyk-project-name }}
+      snyk-org: ${{ inputs.snyk-org }}
+      monitor: ${{ inputs.snyk-force-monitor || needs.setup.outputs.release-branch == 'true' }}
+    secrets:
+      snyk-token: ${{ secrets.snyk-token }}
+
+  docker-build:
+    name: Docker
+    needs: [setup, build, snyk]
+    if: ${{ !cancelled() && inputs.docker-build && needs.snyk.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    uses: ./.github/workflows/docker-build.yaml
+    with:
+      image-name: ${{ inputs.docker-image-name }}
+      context: ${{ inputs.docker-context }}
+      dockerfile: ${{ inputs.docker-file }}
+      build-args: ${{ inputs.docker-build-args }}
+      registry: ${{ inputs.docker-registry }}
+      push: ${{ !inputs.dry-run && (inputs.docker-force-push || needs.setup.outputs.release-branch == 'true') }}
+      export-image: true
+    secrets:
+      registry-username: ${{ secrets.registry-username }}
+      registry-password: ${{ secrets.registry-password }}
+
+  container-scan:
+    name: Snyk Container
+    needs: [setup, docker-build]
+    if: ${{ !cancelled() && inputs.docker-build && needs.docker-build.outputs.image-artifact != '' }}
+    uses: ./.github/workflows/docker-snyk-scan.yaml
+    with:
+      image-artifact: ${{ needs.docker-build.outputs.image-artifact }}
+      dockerfile: ${{ inputs.docker-file || format('{0}/Dockerfile', inputs.docker-context) }}
+      fail-on-issues: ${{ inputs.snyk-fail-on-issues }}
+      severity-threshold: ${{ inputs.snyk-severity-threshold }}
+      project-name: ${{ inputs.snyk-project-name && format('{0}-container', inputs.snyk-project-name) || format('{0}-container', github.repository) }}
+      snyk-org: ${{ inputs.snyk-org }}
+      monitor: ${{ inputs.snyk-force-monitor || needs.setup.outputs.release-branch == 'true' }}
+    secrets:
+      snyk-token: ${{ secrets.snyk-token }}
