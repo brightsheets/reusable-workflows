@@ -6,7 +6,7 @@ name: Snyk Container Scan
 # monitor publishes the snapshot with `snyk container monitor`, grouped per branch.
 #
 # Caller job permissions: contents: read, actions: read, security-events: write,
-# pull-requests: write.
+# pull-requests: write. Without a snyk-token the scan is skipped with a warning.
 
 on:
   workflow_call:
@@ -39,7 +39,8 @@ on:
         default: brightsheets
     secrets:
       snyk-token:
-        required: true
+        required: false
+        description: Snyk token. Without it the scan is skipped with a warning.
 
 permissions:
   contents: read
@@ -62,6 +63,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check for a Snyk token
+        id: token
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: |
+          if [[ -z "$SNYK_TOKEN" ]]; then
+            echo "::warning title=Snyk skipped::No Snyk token was passed. Add a SNYK_TOKEN secret to this repo to turn the Snyk scan on."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download image tar
         uses: actions/download-artifact@v8
         with:
@@ -69,6 +82,7 @@ jobs:
           path: ${{ runner.temp }}/image
 
       - name: Install Snyk CLI
+        if: steps.token.outputs.present == 'true'
         uses: jdx/mise-action@v5
         with:
           mise_toml: |
@@ -77,6 +91,7 @@ jobs:
 
       - name: Snyk Container test
         id: snyk-container
+        if: steps.token.outputs.present == 'true'
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -94,7 +109,7 @@ jobs:
 
       - name: Publish container snapshot to Snyk
         id: snyk-monitor
-        if: inputs.monitor
+        if: inputs.monitor && steps.token.outputs.present == 'true'
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -113,7 +128,7 @@ jobs:
           category: snyk-container
 
       - name: Comment summary on PR
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
         uses: actions/github-script@v9
         env:
           MARKER: "<!-- snyk-container-scan-summary -->"

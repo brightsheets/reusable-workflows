@@ -56,7 +56,7 @@ jobs:
 
 | Secret | Needed for |
 |---|---|
-| `SNYK_TOKEN` | Every Snyk scan. A Snyk service-account token for the `brightsheets` org. With monitor on, its role also needs "View Project Ignores". |
+| `SNYK_TOKEN` | Every Snyk scan. Without it the scans are skipped with a warning and the rest of the pipeline still runs. A Snyk service-account token for the `brightsheets` org. With monitor on, its role also needs "View Project Ignores". |
 | `GO_MODULES_TOKEN` | Repos that import private Go modules from other `brightsheets` repos. A fine-grained PAT with read access to those repos' contents. Alternatively pass `gh-app-id` and `gh-app-private-key` for a GitHub App installed on `brightsheets`. |
 
 Pushing to GHCR uses the built-in `GITHUB_TOKEN`, so it needs no secret.

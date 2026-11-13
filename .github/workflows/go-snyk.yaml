@@ -11,6 +11,7 @@ name: Go Snyk Scan
 # Caller job permissions: contents: read, actions: read, security-events: write,
 # pull-requests: write. The Snyk token's role must be able to test and monitor projects; with
 # monitor it also needs "View Project Ignores", or `snyk code test --report` fails with 403.
+# Without a snyk-token the Snyk steps are skipped with a warning, so the build still passes.
 
 on:
   workflow_call:
@@ -47,7 +48,8 @@ on:
         description: Snyk org ID or slug (--org).
     secrets:
       snyk-token:
-        required: true
+        required: false
+        description: Snyk token. Without it the scans are skipped with a warning.
       go-modules-token:
         required: false
         description: Token that can read the private module repos.
@@ -73,6 +75,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Check for a Snyk token
+        id: token
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: |
+          if [[ -z "$SNYK_TOKEN" ]]; then
+            echo "::warning title=Snyk skipped::No Snyk token was passed. Add a SNYK_TOKEN secret to this repo to turn the Snyk scan on."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: GitHub App token for private modules
         id: app-token
@@ -108,6 +122,7 @@ jobs:
 
       # Pinned; Dependabot only tracks `uses:` lines, so bump this by hand.
       - name: Install Snyk CLI
+        if: steps.token.outputs.present == 'true'
         uses: jdx/mise-action@v5
         with:
           mise_toml: |
@@ -117,6 +132,7 @@ jobs:
       # Snyk exit codes: 0 clean, 1 issues found, anything else = the scan didn't complete.
       - name: Snyk Open Source test
         id: snyk-oss
+        if: steps.token.outputs.present == 'true'
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -133,7 +149,7 @@ jobs:
 
       - name: Publish dependency snapshot to Snyk
         id: snyk-monitor
-        if: inputs.monitor
+        if: inputs.monitor && steps.token.outputs.present == 'true'
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -145,6 +161,7 @@ jobs:
       # Snyk Code has no "critical" level, and needs --project-name with --report.
       - name: Snyk Code test
         id: snyk-code
+        if: steps.token.outputs.present == 'true'
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -182,7 +199,7 @@ jobs:
           category: snyk-code
 
       - name: Comment summary on PR
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
         uses: actions/github-script@v9
         env:
           MARKER: "<!-- snyk-go-scan-summary -->"
