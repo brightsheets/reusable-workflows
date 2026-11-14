@@ -52,8 +52,7 @@ on:
         description: Snyk Code project name when monitor is true. Defaults to owner/repo.
       snyk-org:
         type: string
-        description: Snyk org slug. Defaults to the caller repo's GitHub owner.
-        description: Snyk org ID or slug (--org).
+        description: Snyk org ID or slug (--org). Defaults to the caller repo's GitHub owner.
     secrets:
       snyk-token:
         required: false
