@@ -23,7 +23,7 @@ on:
         type: string
         description: >-
           Comma-separated GitHub owners whose private Go modules this repo needs
-          (e.g. "brightsheets"). Sets GOPRIVATE and git auth for github.com/<owner>/*.
+          (e.g. "acme"). Sets GOPRIVATE and git auth for github.com/<owner>/*.
       gh-app-id:
         type: string
         description: GitHub App ID used for private modules when go-modules-token isn't set (one owner only).
@@ -44,7 +44,7 @@ on:
         description: Snyk Code project name when monitor is true. Defaults to owner/repo.
       snyk-org:
         type: string
-        default: brightsheets
+        description: Snyk org slug. Defaults to the caller repo's GitHub owner.
         description: Snyk org ID or slug (--org).
     secrets:
       snyk-token:
@@ -67,7 +67,7 @@ jobs:
     name: Snyk Scan
     runs-on: ubuntu-24.04
     env:
-      SNYK_ORG: ${{ inputs.snyk-org }}
+      SNYK_ORG: ${{ inputs.snyk-org || github.repository_owner }}
       SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
       PROJECT_NAME: ${{ inputs.project-name || github.repository }}
       REMOTE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}

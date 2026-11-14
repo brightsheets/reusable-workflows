@@ -82,7 +82,7 @@ on:
         type: string
       snyk-org:
         type: string
-        default: brightsheets
+        description: Snyk org slug. Defaults to the caller repo's GitHub owner.
       snyk-force-monitor:
         type: boolean
         default: false

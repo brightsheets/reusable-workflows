@@ -1,6 +1,6 @@
 # reusable-workflows
 
-Reusable GitHub Actions workflows for `brightsheets` repos. Call them from a short workflow in each repo; `/snyk-onboard` writes that caller for you.
+Reusable GitHub Actions workflows for Snyk-scanned repos. Call them from a short workflow in each repo; `/snyk-onboard` writes that caller for you.
 
 | Workflow | What it does |
 |---|---|
@@ -36,9 +36,9 @@ permissions:
 
 jobs:
   ci:
-    uses: brightsheets/reusable-workflows/.github/workflows/go-ci.yaml@v1
+    uses: test-snyk-demo/reusable-workflows/.github/workflows/go-ci.yaml@v1
     with:
-      go-private-owners: brightsheets   # only if it imports private brightsheets modules
+      go-private-owners: <owner>   # only if it imports private Go modules from <owner>
       docker-build: true                # only if the repo has a Dockerfile
     secrets:
       snyk-token: ${{ secrets.SNYK_TOKEN }}
@@ -50,7 +50,7 @@ A JavaScript repo with a Dockerfile:
 ```yaml
 jobs:
   ci:
-    uses: brightsheets/reusable-workflows/.github/workflows/js-ci.yaml@v1
+    uses: test-snyk-demo/reusable-workflows/.github/workflows/js-ci.yaml@v1
     with:
       node-version: "18"
       docker-build: true
@@ -63,7 +63,7 @@ Just the Go Snyk scan:
 ```yaml
 jobs:
   snyk:
-    uses: brightsheets/reusable-workflows/.github/workflows/go-snyk.yaml@v1
+    uses: test-snyk-demo/reusable-workflows/.github/workflows/go-snyk.yaml@v1
     secrets:
       snyk-token: ${{ secrets.SNYK_TOKEN }}
 ```
@@ -72,8 +72,8 @@ jobs:
 
 | Secret | Needed for |
 |---|---|
-| `SNYK_TOKEN` | Every Snyk scan. Without it the scans are skipped with a warning and the rest of the pipeline still runs. A Snyk service-account token for the `brightsheets` org. With monitor on, its role also needs "View Project Ignores". |
-| `GO_MODULES_TOKEN` | Repos that import private Go modules from other `brightsheets` repos. A fine-grained PAT with read access to those repos' contents. Alternatively pass `gh-app-id` and `gh-app-private-key` for a GitHub App installed on `brightsheets`. |
+| `SNYK_TOKEN` | Every Snyk scan. Without it the scans are skipped with a warning and the rest of the pipeline still runs. A Snyk service-account token for the Snyk org named like the repo's GitHub owner. With monitor on, its role also needs "View Project Ignores". |
+| `GO_MODULES_TOKEN` | Repos that import private Go modules from other private repos. A fine-grained PAT with read access to those repos' contents. Alternatively pass `gh-app-id` and `gh-app-private-key` for a GitHub App installed on `brightsheets`. |
 
 Pushing to GHCR uses the built-in `GITHUB_TOKEN`, so it needs no secret.
 
@@ -83,7 +83,7 @@ The build gets a git config with the token as the BuildKit secret `gitconfig`:
 
 ```dockerfile
 RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
-    GOPRIVATE=github.com/brightsheets/* go mod download
+    GOPRIVATE=github.com/<owner>/* go mod download
 ```
 
 ## Versions
@@ -93,8 +93,8 @@ Callers pin `@v1`. The `v1` tag moves to the latest compatible change; breaking 
 Keep `v1` a **lightweight** tag. When it pointed at an annotated tag, every caller of `go-ci.yaml@v1` failed at startup with "workflow file issue", while the same commit worked as `@main`. To move it:
 
 ```
-gh api -X DELETE repos/brightsheets/reusable-workflows/git/refs/tags/v1
-gh api repos/brightsheets/reusable-workflows/git/refs -f ref=refs/tags/v1 -f sha=$(git rev-parse main)
+gh api -X DELETE repos/test-snyk-demo/reusable-workflows/git/refs/tags/v1
+gh api repos/test-snyk-demo/reusable-workflows/git/refs -f ref=refs/tags/v1 -f sha=$(git rev-parse main)
 ```
 
-This repo is private. It's shared with the other `brightsheets` repos through Settings → Actions → General → Access ("Accessible from repositories owned by the user").
+This repo is public, so any repo can call it. Pin callers to `@v1` and keep `v1` a lightweight tag (an annotated tag breaks callers with "workflow file issue").

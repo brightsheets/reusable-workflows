@@ -36,7 +36,7 @@ on:
         description: Snyk project name. Defaults to owner/repo.
       snyk-org:
         type: string
-        default: brightsheets
+        description: Snyk org slug. Defaults to the caller repo's GitHub owner.
     secrets:
       snyk-token:
         required: false
@@ -53,7 +53,7 @@ jobs:
     name: Snyk Container Scan
     runs-on: ubuntu-24.04
     env:
-      SNYK_ORG: ${{ inputs.snyk-org }}
+      SNYK_ORG: ${{ inputs.snyk-org || github.repository_owner }}
       SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
       PROJECT_NAME: ${{ inputs.project-name || github.repository }}
       TARGET_REFERENCE: ${{ github.head_ref || github.ref_name }}

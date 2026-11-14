@@ -52,7 +52,7 @@ on:
         description: Snyk Code project name when monitor is true. Defaults to owner/repo.
       snyk-org:
         type: string
-        default: brightsheets
+        description: Snyk org slug. Defaults to the caller repo's GitHub owner.
         description: Snyk org ID or slug (--org).
     secrets:
       snyk-token:
@@ -71,7 +71,7 @@ jobs:
     runs-on: ${{ fromJson(inputs.runner-labels-json) }}
     env:
       NPM: ${{ inputs.pnpm && 'pnpm' || 'npm' }}
-      SNYK_ORG: ${{ inputs.snyk-org }}
+      SNYK_ORG: ${{ inputs.snyk-org || github.repository_owner }}
       SEVERITY_THRESHOLD: ${{ inputs.severity-threshold }}
       PROJECT_NAME: ${{ inputs.project-name || github.repository }}
       REMOTE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
